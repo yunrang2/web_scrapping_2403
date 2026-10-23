@@ -95,7 +95,7 @@ jobs:
                           try:
                               if page.is_closed():
                                   raise RuntimeError("page closed unexpectedly")
-                              state = page.evaluate("document.readyState", timeout=5000)
+                              state = page.evaluate("document.readyState")
                               ok = state in ("interactive", "complete")
                               record["heartbeat_ok" if ok else "heartbeat_error"] += 1
                               print(json.dumps({
