@@ -1,0 +1,89 @@
+name: One-shot multi-browser connectivity check
+
+on:
+  push:
+    branches:
+      - browser-connectivity-smoke-20261023
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  browser-smoke:
+    name: ${{ matrix.browser }} page load
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright and browser
+        run: |
+          python -m pip install playwright==1.56.0
+          python -m playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Check four pages exactly once
+        env:
+          TEST_BROWSER: ${{ matrix.browser }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          # 한국어: 네 사이트의 페이지 접속만 확인하고 세션을 유지하지 않습니다.
+          # 한국어: 방송 재생과 WebSocket 연결은 막아 시청 세션 테스트와 구분합니다.
+          import json
+          import os
+          import sys
+          from playwright.sync_api import sync_playwright
+
+          URLS = [
+              "https://www.pandalive.co.kr/play/hhhprincesss",
+              "https://livetv.filesun.com/play/hhhprincesss",
+              "https://livetv.pdpop.com/play/hhhprincesss",
+              "https://livetv.tple.co.kr/play/hhhprincesss",
+          ]
+          browser_type_name = os.environ["TEST_BROWSER"]
+          failures = 0
+
+          with sync_playwright() as p:
+              browser_type = getattr(p, browser_type_name)
+              browser = browser_type.launch(headless=True)
+              try:
+                  for url in URLS:
+                      context = browser.new_context(service_workers="block")
+                      context.route_web_socket("**/*", lambda ws: ws.close())
+                      page = context.new_page()
+                      page.route(
+                          "**/*",
+                          lambda route: route.abort()
+                          if route.request.resource_type in ("media", "image", "font")
+                          else route.continue_(),
+                      )
+                      result = {"browser": browser_type_name, "url": url}
+                      try:
+                          response = page.goto(
+                              url, wait_until="domcontentloaded", timeout=20000
+                          )
+                          result["status"] = response.status if response else None
+                          result["final_url"] = page.url
+                          result["title"] = page.title()[:120]
+                          result["ok"] = bool(response and 200 <= response.status < 400)
+                      except Exception as exc:
+                          result["ok"] = False
+                          result["error"] = str(exc)[:240]
+                      finally:
+                          context.close()
+                      print(json.dumps(result, ensure_ascii=False), flush=True)
+                      if not result["ok"]:
+                          failures += 1
+              finally:
+                  browser.close()
+
+          sys.exit(1 if failures else 0)
+          PY
