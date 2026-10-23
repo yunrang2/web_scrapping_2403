@@ -1,47 +1,46 @@
-name: One-shot multi-browser connectivity check
+name: Bounded multi-browser page retention check
 
 on:
   push:
     branches:
       - browser-connectivity-smoke-20261023
   workflow_dispatch:
-  pull_request:
-    branches: [master]
 
 permissions:
   contents: read
 
 jobs:
-  browser-smoke:
-    name: ${{ matrix.browser }} page load
+  retained-page-check:
+    name: ${{ matrix.browser }} 120s page retention
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         browser: [chromium, firefox, webkit]
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Install Playwright and browser
+      - name: Install browser test tools
         run: |
           python -m pip install playwright==1.56.0
           python -m playwright install --with-deps ${{ matrix.browser }}
 
-      - name: Check four pages exactly once
+      - name: Open four pages and retain them for 120 seconds
         env:
           TEST_BROWSER: ${{ matrix.browser }}
+          HOLD_SECONDS: "120"
         shell: bash
         run: |
           python - <<'PY'
-          # 한국어: 네 사이트의 페이지 접속만 확인하고 세션을 유지하지 않습니다.
-          # 한국어: 방송 재생과 WebSocket 연결은 막아 시청 세션 테스트와 구분합니다.
+          # 한국어: 공개 페이지의 로딩 및 브라우저 유지 여부만 검사합니다.
+          # 한국어: 방송 시청 연결과 미디어 재생은 시작하지 않습니다.
           import json
           import os
-          import sys
+          import time
           from playwright.sync_api import sync_playwright
 
           URLS = [
@@ -50,15 +49,16 @@ jobs:
               "https://livetv.pdpop.com/play/hhhprincesss",
               "https://livetv.tple.co.kr/play/hhhprincesss",
           ]
-          browser_type_name = os.environ["TEST_BROWSER"]
-          failures = 0
-
+          browser_name = os.environ["TEST_BROWSER"]
+          hold_seconds = int(os.environ["HOLD_SECONDS"])
+          records = []
           with sync_playwright() as p:
-              browser_type = getattr(p, browser_type_name)
-              browser = browser_type.launch(headless=True)
+              browser = getattr(p, browser_name).launch(headless=True)
+              contexts = []
               try:
                   for url in URLS:
                       context = browser.new_context(service_workers="block")
+                      contexts.append(context)
                       context.route_web_socket("**/*", lambda ws: ws.close())
                       page = context.new_page()
                       page.route(
@@ -67,25 +67,71 @@ jobs:
                           if route.request.resource_type in ("media", "image", "font")
                           else route.continue_(),
                       )
-                      result = {"browser": browser_type_name, "url": url}
+                      record = {"browser": browser_name, "url": url, "page": page,
+                                "initial_ok": False, "heartbeat_ok": 0, "heartbeat_error": 0}
+                      records.append(record)
                       try:
-                          response = page.goto(
-                              url, wait_until="domcontentloaded", timeout=20000
-                          )
-                          result["status"] = response.status if response else None
-                          result["final_url"] = page.url
-                          result["title"] = page.title()[:120]
-                          result["ok"] = bool(response and 200 <= response.status < 400)
+                          response = page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                          record["initial_ok"] = bool(response and response.status == 200)
+                          print(json.dumps({
+                              "event": "OPEN", "browser": browser_name,
+                              "url": url, "http": response.status if response else None,
+                              "page_title": page.title(), "ok": record["initial_ok"]
+                          }, ensure_ascii=False), flush=True)
                       except Exception as exc:
-                          result["ok"] = False
-                          result["error"] = str(exc)[:240]
-                      finally:
-                          context.close()
-                      print(json.dumps(result, ensure_ascii=False), flush=True)
-                      if not result["ok"]:
-                          failures += 1
-              finally:
-                  browser.close()
+                          record["initial_error"] = str(exc)[:180]
+                          print(json.dumps({
+                              "event": "OPEN_ERROR", "browser": browser_name,
+                              "url": url, "error": record["initial_error"]
+                          }, ensure_ascii=False), flush=True)
 
-          sys.exit(1 if failures else 0)
+                  # 한국어: 네 페이지를 닫지 않고 동시에 2분 동안 상태를 확인합니다.
+                  start = time.monotonic()
+                  while (elapsed := time.monotonic() - start) < hold_seconds:
+                      time.sleep(min(15, hold_seconds - elapsed))
+                      elapsed = round(time.monotonic() - start, 1)
+                      for record in records:
+                          page = record["page"]
+                          try:
+                              if page.is_closed():
+                                  raise RuntimeError("page closed unexpectedly")
+                              state = page.evaluate("document.readyState", timeout=5000)
+                              ok = state in ("interactive", "complete")
+                              record["heartbeat_ok" if ok else "heartbeat_error"] += 1
+                              print(json.dumps({
+                                  "event": "HEARTBEAT", "browser": browser_name,
+                                  "url": record["url"], "elapsed_s": elapsed,
+                                  "ready_state": state, "ok": ok
+                              }, ensure_ascii=False), flush=True)
+                          except Exception as exc:
+                              record["heartbeat_error"] += 1
+                              print(json.dumps({
+                                  "event": "HEARTBEAT_ERROR", "browser": browser_name,
+                                  "url": record["url"], "elapsed_s": elapsed,
+                                  "error": str(exc)[:160]
+                              }, ensure_ascii=False), flush=True)
+                  failed = [r for r in records if not r["initial_ok"] or r["heartbeat_error"]]
+                  summary = os.environ.get("GITHUB_STEP_SUMMARY")
+                  if summary:
+                      with open(summary, "a", encoding="utf-8") as f:
+                          f.write(f"### {browser_name}: {hold_seconds}s retention check\n\n")
+                          f.write("| URL | Initial page HTTP 200 | Healthy checks | Errors |\n")
+                          f.write("|---|---|---:|---:|\n")
+                          for r in records:
+                              f.write(
+                                  f"| {r['url']} | {r['initial_ok']} | "
+                                  f"{r['heartbeat_ok']} | {r['heartbeat_error']} |\n"
+                              )
+                  print(json.dumps({
+                      "event": "FINAL", "browser": browser_name,
+                      "hold_seconds": hold_seconds,
+                      "all_pages_healthy": not bool(failed)
+                  }), flush=True)
+                  if failed:
+                      raise SystemExit(1)
+              finally:
+                  # 한국어: 테스트가 끝나면 모든 브라우저 창과 세션을 종료합니다.
+                  for context in contexts:
+                      context.close()
+                  browser.close()
           PY
